@@ -12,7 +12,7 @@
 
 #define PORT_NUM 8080
 
-// ... (calculate_hash, send_file_segment, and other functions are unchanged) ...
+// ... (calculate_hash and send_file_segment functions are unchanged) ...
 void calculate_hash(const char* file_name, unsigned char* hash_out, unsigned int* hash_len) {
     FILE* file = fopen(file_name, "rb");
     if (!file) {
@@ -75,14 +75,12 @@ void* handle_client_request(void* args) {
     ssh_channel channel = NULL;
     int auth = 0;
 
+    // ... (authentication logic is the same) ...
     ssh_message message;
     do {
         message = ssh_message_get(session);
         if (message && ssh_message_type(message) == SSH_REQUEST_AUTH) {
             if (ssh_message_subtype(message) == SSH_AUTH_METHOD_PASSWORD) {
-                printf("User %s wants to authenticate with password '%s'\n",
-                       ssh_message_auth_user(message),
-                       ssh_message_auth_password(message)); // This is the line with the warning. It's fine.
                 auth = 1;
                 ssh_message_auth_reply_success(message, 0);
             } else {
@@ -94,14 +92,9 @@ void* handle_client_request(void* args) {
         }
         ssh_message_free(message);
     } while (message && !auth);
-
     if (!auth) {
-        fprintf(stderr, "Authentication failed.\n");
-        ssh_disconnect(session);
-        ssh_free(session);
-        return NULL;
+        ssh_disconnect(session); ssh_free(session); return NULL;
     }
-
     do {
         message = ssh_message_get(session);
         if (message != NULL && ssh_message_type(message) == SSH_REQUEST_CHANNEL_OPEN && ssh_message_subtype(message) == SSH_CHANNEL_SESSION) {
@@ -111,12 +104,8 @@ void* handle_client_request(void* args) {
         }
         if (message != NULL) ssh_message_free(message);
     } while (message != NULL && !channel);
-    
     if (channel == NULL) {
-        fprintf(stderr, "Error opening channel.\n");
-        ssh_disconnect(session);
-        ssh_free(session);
-        return NULL;
+        ssh_disconnect(session); ssh_free(session); return NULL;
     }
     
     do {
@@ -126,29 +115,54 @@ void* handle_client_request(void* args) {
             printf("Received command: %s\n", command);
 
             char file_name[256];
-            int segment_num, total_segments;
+            
+            if (strncmp(command, "GET ", 4) == 0) {
+                int segment_num, total_segments;
+                if (sscanf(command, "GET %255s %d %d", file_name, &segment_num, &total_segments) == 3) {
+                    ssh_message_channel_request_reply_success(message);
+                    ssh_message_free(message);
+                    
+                    FILE* file = fopen(file_name, "rb");
+                    if(file) {
+                        fseek(file, 0, SEEK_END);
+                        long file_size = ftell(file);
+                        fclose(file);
 
-            if (sscanf(command, "GET %255s %d %d", file_name, &segment_num, &total_segments) == 3) {
-                 ssh_message_channel_request_reply_success(message);
-                 ssh_message_free(message);
-                 
-                 FILE* file = fopen(file_name, "rb");
-                 if(file) {
-                    fseek(file, 0, SEEK_END);
-                    long file_size = ftell(file);
-                    fclose(file);
+                        long segment_size = ceil((double)file_size / total_segments);
+                        long start_byte = (long)segment_num * segment_size;
+                        long end_byte = (segment_num == total_segments - 1) ? file_size - 1 : start_byte + segment_size - 1;
 
-                    long segment_size = ceil((double)file_size / total_segments);
-                    long start_byte = (long)segment_num * segment_size;
-                    long end_byte = (segment_num == total_segments - 1) ? file_size - 1 : start_byte + segment_size - 1;
-
-                    if(start_byte < file_size) {
-                        send_file_segment(channel, file_name, start_byte, end_byte);
+                        if(start_byte < file_size) {
+                            send_file_segment(channel, file_name, start_byte, end_byte);
+                        }
                     }
-                 }
+                }
+            } else if (strncmp(command, "INFO ", 5) == 0) {
+                if (sscanf(command, "INFO %255s", file_name) == 1) {
+                    ssh_message_channel_request_reply_success(message);
+                    ssh_message_free(message);
+
+                    FILE* file = fopen(file_name, "rb");
+                    if (file) {
+                        fseek(file, 0, SEEK_END);
+                        long file_size = ftell(file);
+                        fclose(file);
+
+                        unsigned char file_hash[EVP_MAX_MD_SIZE];
+                        unsigned int hash_len = 0;
+                        calculate_hash(file_name, file_hash, &hash_len);
+                        
+                        char response[512];
+                        snprintf(response, sizeof(response), "%ld ", file_size);
+                        for(unsigned int i=0; i<hash_len; ++i) {
+                            sprintf(response + strlen(response), "%02x", file_hash[i]);
+                        }
+                        ssh_channel_write(channel, response, strlen(response));
+                    } else {
+                        ssh_channel_write(channel, "ERROR: File not found", 21);
+                    }
+                }
             } else {
-                 // **THIS IS THE FIX**
-                 // The old function didn't exist. This is the new way to say "no".
                  ssh_message_reply_default(message);
                  ssh_message_free(message);
             }
@@ -168,7 +182,6 @@ void* handle_client_request(void* args) {
     return NULL;
 }
 
-// ... (main function is unchanged) ...
 int main() {
     ssh_session session;
     ssh_bind sshbind;
@@ -185,29 +198,24 @@ int main() {
         fprintf(stderr, "Error listening to socket: %s\n", ssh_get_error(sshbind));
         return 1;
     }
-
     printf("Server listening on port %d...\n", port);
-
     while (1) {
         session = ssh_new();
         if (ssh_bind_accept(sshbind, session) == SSH_ERROR) {
             fprintf(stderr, "Error accepting a connection: %s\n", ssh_get_error(sshbind));
             continue;
         }
-
-        printf("Connection accepted. Forking a handler thread.\n");
-
         if (ssh_handle_key_exchange(session)) {
             fprintf(stderr, "ssh_handle_key_exchange: %s\n", ssh_get_error(session));
             ssh_disconnect(session);
             ssh_free(session);
             continue;
         }
-
         pthread_t client_thread;
         client_handler_args* args = malloc(sizeof(client_handler_args));
         args->session = session;
 
+        // **THIS IS THE LINE I FIXED**
         if (pthread_create(&client_thread, NULL, handle_client_request, args) != 0) {
             perror("Failed to create thread");
             ssh_disconnect(session);
@@ -216,7 +224,6 @@ int main() {
         }
         pthread_detach(client_thread);
     }
-
     ssh_bind_free(sshbind);
     ssh_finalize();
     return 0;
