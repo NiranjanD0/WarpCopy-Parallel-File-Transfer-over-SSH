@@ -1,6 +1,6 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -lm -lpthread -lcrypto
+CFLAGS = -Wall -lm -lpthread -lcrypto -lssh
 
 # Executable names
 CLIENT_EXEC = client
