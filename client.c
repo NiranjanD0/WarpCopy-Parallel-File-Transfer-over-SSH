@@ -109,73 +109,192 @@ void* progress_display(void *arg) {
     return NULL;
 }
 
-// Thread function to receive file segment
+// Thread function with retry logic and offset reset fix
 void* receive_file_segment(void* arg) {
     thread_arg* t_arg = (thread_arg*)arg;
-    ssh_session session;
-    ssh_channel channel;
-    int rc;
+    
+    // Calculate chunk boundaries
+    long chunk_size = t_arg->file_size / t_arg->total_threads;
+    long start_byte = (long)t_arg->thread_id * chunk_size;
+    long end_byte;
 
-    session = ssh_new();
+    if (t_arg->thread_id == t_arg->total_threads - 1) {
+        end_byte = t_arg->file_size - 1;
+    } else {
+        end_byte = start_byte + chunk_size - 1;
+    }
+
+    long bytes_expected = end_byte - start_byte + 1;
+    long current_offset = start_byte;
+    long bytes_received = 0;
+    
+    char buffer[65536];  // 64KB buffer
+    int nbytes;
+    
+    int max_retries = 3;
+    int retry_count = 0;
+    
+retry_transfer:
+    // ========== CRITICAL FIX: Reset offset on retry ==========
+    bytes_received = 0;
+    current_offset = start_byte;  // Reset write position to start of chunk
+    
+    if (retry_count > 0) {
+        fprintf(stderr, COLOR_YELLOW "\n🔄 Thread %d: Retry %d/%d (redownloading chunk)\n" COLOR_RESET,
+                t_arg->thread_id, retry_count, max_retries);
+        sleep(2 + retry_count);
+    }
+    
+    // Each thread creates its own SSH session
+    ssh_session session = ssh_new();
+    if (!session) {
+        fprintf(stderr, COLOR_RED "Thread %d: Failed to create SSH session\n" COLOR_RESET, t_arg->thread_id);
+        pthread_exit(NULL);
+    }
+    
     int port = PORT_NUM;
     ssh_options_set(session, SSH_OPTIONS_HOST, t_arg->server_ip);
     ssh_options_set(session, SSH_OPTIONS_PORT, &port);
     ssh_options_set(session, SSH_OPTIONS_HOSTKEYS, "rsa-sha2-512,rsa-sha2-256,ssh-rsa");
     ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, 0);
-
-    rc = ssh_connect(session);
+    
+    long timeout = 120;
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
+    
+    int rc = ssh_connect(session);
     if (rc != SSH_OK) {
-        fprintf(stderr, COLOR_RED "Thread %d: Error connecting: %s\n" COLOR_RESET, 
+        fprintf(stderr, COLOR_RED "Thread %d: Connect failed: %s\n" COLOR_RESET,
                 t_arg->thread_id, ssh_get_error(session));
         ssh_free(session);
+        
+        if (retry_count < max_retries) {
+            retry_count++;
+            goto retry_transfer;
+        }
         pthread_exit(NULL);
     }
-
+    
     rc = ssh_userauth_password(session, "user", "pass");
     if (rc != SSH_AUTH_SUCCESS) {
-        fprintf(stderr, COLOR_RED "Thread %d: Auth failed: %s\n" COLOR_RESET, 
-                t_arg->thread_id, ssh_get_error(session));
+        fprintf(stderr, COLOR_RED "Thread %d: Auth failed\n" COLOR_RESET, t_arg->thread_id);
         ssh_disconnect(session);
         ssh_free(session);
+        
+        if (retry_count < max_retries) {
+            retry_count++;
+            goto retry_transfer;
+        }
         pthread_exit(NULL);
     }
-
-    channel = ssh_channel_new(session);
+    
+    ssh_channel channel = ssh_channel_new(session);
+    if (!channel) {
+        fprintf(stderr, COLOR_RED "Thread %d: Channel creation failed\n" COLOR_RESET, t_arg->thread_id);
+        ssh_disconnect(session);
+        ssh_free(session);
+        
+        if (retry_count < max_retries) {
+            retry_count++;
+            goto retry_transfer;
+        }
+        pthread_exit(NULL);
+    }
+    
     rc = ssh_channel_open_session(channel);
     if (rc != SSH_OK) {
+        fprintf(stderr, COLOR_RED "Thread %d: Channel open failed\n" COLOR_RESET, t_arg->thread_id);
         ssh_channel_free(channel);
         ssh_disconnect(session);
         ssh_free(session);
+        
+        if (retry_count < max_retries) {
+            retry_count++;
+            goto retry_transfer;
+        }
         pthread_exit(NULL);
     }
-
+    
     char command[512];
-    snprintf(command, sizeof(command), "GET %s %d %d", t_arg->file_name, 
+    snprintf(command, sizeof(command), "GET %s %d %d", t_arg->file_name,
              t_arg->thread_id, t_arg->total_threads);
+    
     rc = ssh_channel_request_exec(channel, command);
     if (rc != SSH_OK) {
+        fprintf(stderr, COLOR_RED "Thread %d: Exec failed\n" COLOR_RESET, t_arg->thread_id);
         ssh_channel_close(channel);
         ssh_channel_free(channel);
         ssh_disconnect(session);
         ssh_free(session);
+        
+        if (retry_count < max_retries) {
+            retry_count++;
+            goto retry_transfer;
+        }
         pthread_exit(NULL);
     }
-
-    char buffer[65536];  // 64KB buffer
-    int nbytes;
-    long segment_size = ceil((double)t_arg->file_size / t_arg->total_threads);
-    long current_offset = (long)t_arg->thread_id * segment_size;
-
-    while ((nbytes = ssh_channel_read(channel, buffer, sizeof(buffer), 0)) > 0) {
+    
+    // Robust read loop
+    while (bytes_received < bytes_expected) {
+        long remaining = bytes_expected - bytes_received;
+        size_t to_request = (remaining < sizeof(buffer)) ? remaining : sizeof(buffer);
+        
+        nbytes = ssh_channel_read(channel, buffer, to_request, 0);
+        
+        if (nbytes < 0) {
+            fprintf(stderr, COLOR_RED "\n❌ Thread %d: Read error\n" COLOR_RESET, t_arg->thread_id);
+            ssh_channel_close(channel);
+            ssh_channel_free(channel);
+            ssh_disconnect(session);
+            ssh_free(session);
+            
+            // Subtract bytes we thought we had from progress
+            pthread_mutex_lock(&global_progress.lock);
+            global_progress.bytes_downloaded -= bytes_received;
+            pthread_mutex_unlock(&global_progress.lock);
+            
+            if (retry_count < max_retries) {
+                retry_count++;
+                goto retry_transfer;
+            }
+            pthread_exit(NULL);
+        }
+        
+        if (nbytes == 0) {
+            if (bytes_received < bytes_expected) {
+                fprintf(stderr, COLOR_RED "\n❌ Thread %d: Early EOF (got %ld/%ld)\n" COLOR_RESET,
+                        t_arg->thread_id, bytes_received, bytes_expected);
+                ssh_channel_close(channel);
+                ssh_channel_free(channel);
+                ssh_disconnect(session);
+                ssh_free(session);
+                
+                // Subtract bytes we thought we had from progress
+                pthread_mutex_lock(&global_progress.lock);
+                global_progress.bytes_downloaded -= bytes_received;
+                pthread_mutex_unlock(&global_progress.lock);
+                
+                if (retry_count < max_retries) {
+                    retry_count++;
+                    goto retry_transfer;
+                }
+            }
+            break;
+        }
+        
         pwrite(t_arg->output_fd, buffer, nbytes, current_offset);
         current_offset += nbytes;
+        bytes_received += nbytes;
         
-        // Update progress
         pthread_mutex_lock(&global_progress.lock);
         global_progress.bytes_downloaded += nbytes;
         pthread_mutex_unlock(&global_progress.lock);
     }
-
+    
+    if (bytes_received == bytes_expected) {
+        printf(COLOR_GREEN "\n✓ Thread %d: Complete (%ld bytes)\n" COLOR_RESET,
+               t_arg->thread_id, bytes_received);
+    }
+    
     ssh_channel_send_eof(channel);
     ssh_channel_close(channel);
     ssh_channel_free(channel);
@@ -202,8 +321,7 @@ int get_file_info(const char* server_ip, const char* file_name, long* file_size,
     }
 
     if (ssh_userauth_password(session, "user", "pass") != SSH_AUTH_SUCCESS) {
-        fprintf(stderr, COLOR_RED "✗ Auth failed for info check: %s\n" COLOR_RESET, 
-                ssh_get_error(session));
+        fprintf(stderr, COLOR_RED "✗ Auth failed\n" COLOR_RESET);
         ssh_disconnect(session);
         ssh_free(session);
         return -1;
@@ -252,8 +370,7 @@ void list_server_files(const char* server_ip) {
     ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, 0);
     
     if (ssh_connect(session) != SSH_OK) {
-        fprintf(stderr, COLOR_RED "✗ Error connecting: %s\n" COLOR_RESET, 
-                ssh_get_error(session));
+        fprintf(stderr, COLOR_RED "✗ Error connecting: %s\n" COLOR_RESET, ssh_get_error(session));
         ssh_free(session);
         return;
     }
@@ -290,21 +407,16 @@ void list_server_files(const char* server_ip) {
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <server_ip> [--list | <file_path> <num_threads>]\n", argv[0]);
-        fprintf(stderr, "Examples:\n");
-        fprintf(stderr, "  %s 192.168.1.100 --list\n", argv[0]);
-        fprintf(stderr, "  %s 192.168.1.100 /path/to/file.zip 8\n", argv[0]);
         return -1;
     }
     
     char* server_ip = argv[1];
     
-    // Handle list command
     if (argc == 3 && strcmp(argv[2], "--list") == 0) {
         list_server_files(server_ip);
         return 0;
     }
     
-    // Original download logic
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <server_ip> <file_path> <num_threads>\n", argv[0]);
         fprintf(stderr, "   or: %s <server_ip> --list\n", argv[0]);
@@ -314,51 +426,42 @@ int main(int argc, char* argv[]) {
     char* file_path = argv[2];
     int num_threads = atoi(argv[3]);
     
-    // Create Downloads directory if it doesn't exist
     struct stat st = {0};
     if (stat("Downloads", &st) == -1) {
         mkdir("Downloads", 0755);
-        printf(COLOR_BLUE "📂 Created Downloads directory\n" COLOR_RESET);
     }
     
-    // Extract just the filename from the path
     char *file_name_only = basename(file_path);
     
-    // Step 1: Get file info from server
     long file_size = 0;
     unsigned char server_hash[EVP_MAX_MD_SIZE];
     printf(COLOR_BLUE "🔍 Asking server for info about '%s'...\n" COLOR_RESET, file_path);
     
     if (get_file_info(server_ip, file_path, &file_size, server_hash) != 0) {
-        fprintf(stderr, COLOR_RED "✗ Could not get file info from server. Does the file exist?\n" COLOR_RESET);
         return -1;
     }
     
-    printf(COLOR_GREEN "✓ Server says file size is %ld bytes (%.2f MB)\n" COLOR_RESET, 
+    printf(COLOR_GREEN "✓ File size: %ld bytes (%.2f MB)\n" COLOR_RESET, 
            file_size, file_size / (1024.0 * 1024.0));
     
-    // Step 2: Prepare output file in Downloads directory
     char output_file_path[512];
     snprintf(output_file_path, sizeof(output_file_path), "Downloads/%s", file_name_only);
     
     int output_fd = open(output_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (output_fd < 0) {
-        perror(COLOR_RED "✗ Failed to create output file" COLOR_RESET);
+        perror("Failed to create output file");
         return -1;
     }
     
-    // Initialize progress tracking
     global_progress.total_bytes = file_size;
     global_progress.bytes_downloaded = 0;
     global_progress.start_time = time(NULL);
     global_progress.active = 1;
     
-    // Start progress display thread
     pthread_t progress_thread;
     pthread_create(&progress_thread, NULL, progress_display, NULL);
     
-    // Step 3: Start parallel download
-    printf(COLOR_BLUE "🚀 Spawning %d download threads...\n" COLOR_RESET, num_threads);
+    printf(COLOR_BLUE "🚀 Starting %d download threads...\n" COLOR_RESET, num_threads);
     pthread_t threads[num_threads];
     thread_arg args[num_threads];
     
@@ -376,28 +479,26 @@ int main(int argc, char* argv[]) {
         pthread_join(threads[i], NULL);
     }
     
-    // Stop progress display
     global_progress.active = 0;
     pthread_join(progress_thread, NULL);
     
     close(output_fd);
-    printf(COLOR_GREEN "✓ File transfer complete. Saved to '%s'\n" COLOR_RESET, output_file_path);
+    printf(COLOR_GREEN "\n✓ Transfer complete: '%s'\n" COLOR_RESET, output_file_path);
     
-    // Step 4: Verify hash
-    printf(COLOR_BLUE "🔐 Verifying file integrity...\n" COLOR_RESET);
+    printf(COLOR_BLUE "🔐 Verifying integrity...\n" COLOR_RESET);
     unsigned char client_hash[EVP_MAX_MD_SIZE];
     unsigned int client_hash_len = 0;
     calculate_hash(output_file_path, client_hash, &client_hash_len);
     
     if (client_hash_len > 0 && memcmp(server_hash, client_hash, client_hash_len) == 0) {
-        printf(COLOR_GREEN "✓ File integrity verified: Hashes match!\n" COLOR_RESET);
+        printf(COLOR_GREEN "✓ Hash verified!\n" COLOR_RESET);
     } else {
-        printf(COLOR_RED "✗ File integrity compromised: Hash mismatch!\n" COLOR_RESET);
+        printf(COLOR_RED "✗ Hash mismatch!\n" COLOR_RESET);
     }
     
-    printf("\nServer Hash:   ");
+    printf("\nServer:   ");
     for(int i=0; i < 32; i++) printf("%02x", server_hash[i]);
-    printf("\nReceived Hash: ");
+    printf("\nReceived: ");
     for(int i=0; i < client_hash_len; i++) printf("%02x", client_hash[i]);
     printf("\n");
     
