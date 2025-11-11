@@ -38,7 +38,7 @@ void calculate_hash(const char* file_name, unsigned char* hash_out, unsigned int
     EVP_MD_CTX_free(mdctx);
 }
 
-// Send file segment function
+// ========== FIX #3: Improved send_file_segment with bounds checking ==========
 void send_file_segment(ssh_channel channel, const char *file_name, long start_byte, long end_byte) {
     int fd = open(file_name, O_RDONLY);
     if (fd < 0) {
@@ -46,14 +46,31 @@ void send_file_segment(ssh_channel channel, const char *file_name, long start_by
         return;
     }
 
+    struct stat st;
+    fstat(fd, &st);
+    long actual_file_size = st.st_size;
+    
+    if (end_byte >= actual_file_size) {
+        end_byte = actual_file_size - 1;
+    }
+
     long bytes_to_send = end_byte - start_byte + 1;
-    char buffer[65536];  // 64KB buffer
+    char buffer[65536];
+    
+    if (lseek(fd, start_byte, SEEK_SET) < 0) {
+        perror("lseek failed");
+        close(fd);
+        return;
+    }
+
+    printf("Sending segment [%ld - %ld] = %ld bytes\n", start_byte, end_byte, bytes_to_send);
 
     while (bytes_to_send > 0) {
         ssize_t to_read = (bytes_to_send < sizeof(buffer)) ? bytes_to_send : sizeof(buffer);
-        ssize_t bytes_read = pread(fd, buffer, to_read, start_byte);
+        ssize_t bytes_read = read(fd, buffer, to_read);
+        
         if (bytes_read <= 0) {
-            perror("pread failed");
+            if (bytes_read < 0) perror("read failed");
             break;
         }
 
@@ -64,13 +81,15 @@ void send_file_segment(ssh_channel channel, const char *file_name, long start_by
         }
 
         bytes_to_send -= bytes_read;
-        start_byte += bytes_read;
     }
 
+    // Give client time to receive all data before closing channel
+    usleep(100000);  // 100ms delay - THIS IS THE FIX, no flush needed
+    
     close(fd);
-    printf("Segment transfer complete: [%ld - %ld]\n", 
-           start_byte - (end_byte - start_byte + 1), end_byte);
+    printf("Segment transfer complete: [%ld - %ld]\n", start_byte, end_byte);
 }
+
 
 // Handle LIST command
 void handle_list_command(ssh_channel channel) {
@@ -85,7 +104,7 @@ void handle_list_command(ssh_channel channel) {
     char response[16384] = "";
     
     snprintf(response, sizeof(response), 
-            "%-50s %15s %20s\n", "Filename", "Size (bytes)", "Modified");
+             "%-50s %15s %20s\n", "Filename", "Size (bytes)", "Modified");
     strcat(response, "--------------------------------------------------------------------------------\n");
     
     while ((entry = readdir(dir)) != NULL) {
@@ -188,10 +207,24 @@ void* handle_client_request(void* args) {
                         long file_size = ftell(file);
                         fclose(file);
 
-                        long segment_size = ceil((double)file_size / total_segments);
-                        long start_byte = (long)segment_num * segment_size;
-                        long end_byte = (segment_num == total_segments - 1) ? 
-                                       file_size - 1 : start_byte + segment_size - 1;
+                        // ========== FIX #4: Match client's chunk calculation EXACTLY ==========
+                        // OLD CODE: long segment_size = ceil((double)file_size / total_segments);
+                        // PROBLEM: ceil() on server != division on client, misaligned chunks
+                        
+                        // NEW CODE: Same integer division logic as client
+                        long chunk_size = file_size / total_segments;
+                        long start_byte = (long)segment_num * chunk_size;
+                        long end_byte;
+
+                        // Last segment gets everything remaining (handles non-divisible file sizes)
+                        if (segment_num == total_segments - 1) {
+                            end_byte = file_size - 1;
+                        } else {
+                            end_byte = start_byte + chunk_size - 1;
+                        }
+
+                        printf("Thread %d requesting: [%ld - %ld] = %ld bytes\n", 
+                               segment_num, start_byte, end_byte, end_byte - start_byte + 1);
 
                         if(start_byte < file_size) {
                             send_file_segment(channel, file_name, start_byte, end_byte);
@@ -225,7 +258,7 @@ void* handle_client_request(void* args) {
                         strcat(response, "\n");
                         ssh_channel_write(channel, response, strlen(response));
                     } else {
-                        const char* error_msg = "ERROR: File not found\n";
+                        const char *error_msg = "ERROR: File not found\n";
                         ssh_channel_write(channel, error_msg, strlen(error_msg));
                     }
                     break;
