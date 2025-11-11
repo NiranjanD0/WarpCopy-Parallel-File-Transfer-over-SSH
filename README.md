@@ -29,8 +29,8 @@ sudo apt update
 sudo apt install build-essential libssh-dev libssl-dev
 ```
 
+On Arch-based systems:
 ```bash
-# On Arch-based systems:
 sudo pacman -S base-devel libssh openssl
 ```
 
@@ -73,11 +73,11 @@ The client does not require `sudo` privileges.
 
 1.  **Run the client:**
     ```bash
-    # Usage: ./client <server_ip_or_domain> <file_name_on_server> <num_threads>
+    # Usage: ./client <server_ip_or_domain> <absolute_path_on_server> <num_threads>
     
-    # Example: ./client vm.niranjan0.xyz my_big_file.zip 8
+    # Example: ./client vm.niranjan0.xyz /home/nir/test.zip 4
     ```
-2.  This command will download the file using 8 parallel connections and save it locally as `rcv_my_big_file.zip`.
+2.  This command will download the file using 4 parallel connections and saves it to a local `Downloads/` folder with the original filename.
 
 ---
 
@@ -88,11 +88,31 @@ The program follows a specific protocol to ensure an efficient and verifiable tr
 1.  **The `INFO` Request:** The client first opens a single SSH connection to the server and sends an `INFO <file_name>` command.
 2.  **The Server's Reply:** The server receives the request, calculates the target file's SHA-256 hash and total size, and sends this metadata back to the client as a single string (e.g., `"50000000 9c623...410db"`).
 3.  **The Client's Plan:** The client receives the metadata. It now has the expected hash for verification and the total size for calculating segments.
-4.  **Parallel Connections:** The client spawns the user-specified number of threads (e.g., 8 threads).
-5.  **The `GET` Request:** Each thread opens its own separate SSH connection to the server and requests a unique segment of the file.
+4.  **Parallel Connections:** The client spawns the user-specified number of threads (e.g., 4 threads), each opening its own SSH session.
+5.  **The `GET` Request:** Each thread requests a unique segment of the file via a `GET` command.
     * Thread 0 asks for: `GET <file_name> 0 8`
     * Thread 1 asks for: `GET <file_name> 1 8`
     * ...and so on.
 6.  **Segment Delivery:** The server handles each connection concurrently, streaming the appropriate segment of the file to each client thread.
-7.  **File Reassembly:** On the client, each thread receives its data segment and uses the `pwrite()` system call to write it to the correct offset in the output file. This allows all threads to write to the same file simultaneously without race conditions or the need for a mutex.
-8.  **Verification:** Once all threads have completed, the client calculates the SHA-256 hash of the newly created local file and compares it to the hash received from the server in step 2. If they match, the transfer is considered successful.
+7.  **File Reassembly:** On the client, threads write directly into their file chunk offset using `pwrite()`, allowing simultaneous writes without overlap or mutexes.
+8.  **Retries:** Failed transfers retry up to 3 times per thread, resetting write offsets correctly.
+9.  **Verification:** Once all threads have completed, the client calculates the SHA-256 hash of the newly created local file and compares it to the hash received from the server in step 2. If they match, the transfer is considered successful.
+
+## Note
+
+Since each download thread opens its own SSH session. Some servers limit concurrent sessions, causing refusals if too many threads run.
+
+To fix:
+```bash
+sudo vi /etc/ssh/sshd_config
+```
+Add or update:
+```
+MaxStartups 50:30:100
+MaxSessions 50
+```
+Then restart SSH:
+```bash
+sudo systemctl restart sshd
+```
+tweak values as needed to match ur setup.
