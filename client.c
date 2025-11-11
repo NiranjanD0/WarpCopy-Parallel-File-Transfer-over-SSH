@@ -109,7 +109,7 @@ void* progress_display(void *arg) {
     return NULL;
 }
 
-// Thread function to receive file segment
+// ========== CRITICAL FIX: Thread function to receive file segment ==========
 void* receive_file_segment(void* arg) {
     thread_arg* t_arg = (thread_arg*)arg;
     ssh_session session;
@@ -122,6 +122,10 @@ void* receive_file_segment(void* arg) {
     ssh_options_set(session, SSH_OPTIONS_PORT, &port);
     ssh_options_set(session, SSH_OPTIONS_HOSTKEYS, "rsa-sha2-512,rsa-sha2-256,ssh-rsa");
     ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, 0);
+    
+    // Add timeout to prevent hanging
+    long timeout = 60;
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
 
     rc = ssh_connect(session);
     if (rc != SSH_OK) {
@@ -161,19 +165,61 @@ void* receive_file_segment(void* arg) {
         pthread_exit(NULL);
     }
 
-    char buffer[65536];  // 64KB buffer
-    int nbytes;
-    long segment_size = ceil((double)t_arg->file_size / t_arg->total_threads);
-    long current_offset = (long)t_arg->thread_id * segment_size;
+    // Calculate exact chunk boundaries
+    long chunk_size = t_arg->file_size / t_arg->total_threads;
+    long start_byte = (long)t_arg->thread_id * chunk_size;
+    long end_byte;
 
-    while ((nbytes = ssh_channel_read(channel, buffer, sizeof(buffer), 0)) > 0) {
+    if (t_arg->thread_id == t_arg->total_threads - 1) {
+        end_byte = t_arg->file_size - 1;
+    } else {
+        end_byte = start_byte + chunk_size - 1;
+    }
+
+    long current_offset = start_byte;
+    long bytes_expected = end_byte - start_byte + 1;
+    long bytes_received = 0;
+
+    char buffer[8192];
+    int nbytes;
+
+    // Keep reading until we have ALL expected bytes
+    while (bytes_received < bytes_expected) {
+        long remaining = bytes_expected - bytes_received;
+        size_t to_request = (remaining < sizeof(buffer)) ? remaining : sizeof(buffer);
+        
+        nbytes = ssh_channel_read(channel, buffer, to_request, 0);
+        
+        if (nbytes < 0) {
+            fprintf(stderr, COLOR_RED "Thread %d: Read error from channel\n" COLOR_RESET, 
+                    t_arg->thread_id);
+            break;
+        }
+        
+        if (nbytes == 0) {
+            if (bytes_received < bytes_expected) {
+                fprintf(stderr, COLOR_RED "Thread %d: Channel closed early! Got %ld/%ld bytes\n" COLOR_RESET,
+                        t_arg->thread_id, bytes_received, bytes_expected);
+            }
+            break;
+        }
+        
         pwrite(t_arg->output_fd, buffer, nbytes, current_offset);
         current_offset += nbytes;
+        bytes_received += nbytes;
         
-        // Update progress
         pthread_mutex_lock(&global_progress.lock);
         global_progress.bytes_downloaded += nbytes;
         pthread_mutex_unlock(&global_progress.lock);
+    }
+
+    if (bytes_received != bytes_expected) {
+        fprintf(stderr, COLOR_YELLOW "⚠ Thread %d: Short read - expected %ld, got %ld bytes (%.1f%% complete)\n" COLOR_RESET,
+                t_arg->thread_id, bytes_expected, bytes_received, 
+                (bytes_received * 100.0) / bytes_expected);
+    } else {
+        printf(COLOR_GREEN "Thread %d: Successfully received %ld bytes [%ld - %ld]\n" COLOR_RESET,
+               t_arg->thread_id, bytes_received, start_byte, end_byte);
     }
 
     ssh_channel_send_eof(channel);
@@ -183,6 +229,7 @@ void* receive_file_segment(void* arg) {
     ssh_free(session);
     pthread_exit(NULL);
 }
+
 
 // Get file info from server
 int get_file_info(const char* server_ip, const char* file_name, long* file_size, 
@@ -403,3 +450,4 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
+
