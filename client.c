@@ -140,7 +140,7 @@ retry_transfer:
     current_offset = start_byte;  // Reset write position to start of chunk
     
     if (retry_count > 0) {
-        fprintf(stderr, COLOR_YELLOW "\n🔄 Thread %d: Retry %d/%d (redownloading chunk)\n" COLOR_RESET,
+        fprintf(stderr, COLOR_YELLOW "\nThread %d: Retry %d/%d (redownloading chunk)\n" COLOR_RESET,
                 t_arg->thread_id, retry_count, max_retries);
         sleep(2 + retry_count);
     }
@@ -215,8 +215,7 @@ retry_transfer:
     }
     
     char command[512];
-    snprintf(command, sizeof(command), "GET %s %d %d", t_arg->file_name,
-             t_arg->thread_id, t_arg->total_threads);
+    snprintf(command, sizeof(command), "GET %s %d %d", t_arg->file_name, t_arg->thread_id, t_arg->total_threads);
     
     rc = ssh_channel_request_exec(channel, command);
     if (rc != SSH_OK) {
@@ -241,7 +240,7 @@ retry_transfer:
         nbytes = ssh_channel_read(channel, buffer, to_request, 0);
         
         if (nbytes < 0) {
-            fprintf(stderr, COLOR_RED "\n❌ Thread %d: Read error\n" COLOR_RESET, t_arg->thread_id);
+            fprintf(stderr, COLOR_RED "\nThread %d: Read error\n" COLOR_RESET, t_arg->thread_id);
             ssh_channel_close(channel);
             ssh_channel_free(channel);
             ssh_disconnect(session);
@@ -291,8 +290,7 @@ retry_transfer:
     }
     
     if (bytes_received == bytes_expected) {
-        printf(COLOR_GREEN "\n✓ Thread %d: Complete (%ld bytes)\n" COLOR_RESET,
-               t_arg->thread_id, bytes_received);
+        printf(COLOR_GREEN "\n✓ Thread %d: Complete (%ld bytes)\n" COLOR_RESET, t_arg->thread_id, bytes_received);
     }
     
     ssh_channel_send_eof(channel);
@@ -305,7 +303,7 @@ retry_transfer:
 
 // Get file info from server
 int get_file_info(const char* server_ip, const char* file_name, long* file_size, 
-                  unsigned char* server_hash) {
+    unsigned char* server_hash) {
     ssh_session session = ssh_new();
     int port = PORT_NUM;
     ssh_options_set(session, SSH_OPTIONS_HOST, server_ip);
@@ -338,7 +336,7 @@ int get_file_info(const char* server_ip, const char* file_name, long* file_size,
     ssh_channel_read(channel, buffer, sizeof(buffer), 0);
 
     if (strncmp(buffer, "ERROR", 5) == 0) {
-        fprintf(stderr, COLOR_RED "✗ Server error: %s\n" COLOR_RESET, buffer);
+        fprintf(stderr, COLOR_RED "\n✗ Server error: %s\n" COLOR_RESET, buffer);
         ssh_channel_close(channel);
         ssh_channel_free(channel);
         ssh_disconnect(session);
@@ -391,7 +389,7 @@ void list_server_files(const char* server_ip) {
     int nbytes;
     
     while ((nbytes = ssh_channel_read(channel, buffer + total_read, 
-                                       sizeof(buffer) - total_read - 1, 0)) > 0) {
+        sizeof(buffer) - total_read - 1, 0)) > 0) {
         total_read += nbytes;
     }
     
@@ -405,63 +403,83 @@ void list_server_files(const char* server_ip) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <server_ip> [--list | <file_path> <num_threads>]\n", argv[0]);
+    char server_ip[256], file_path[256];
+    int num_threads;
+
+    // Check if arguments provided
+    if (argc == 4) {
+        // Use command line arguments
+        strncpy(server_ip, argv[1], sizeof(server_ip) - 1);
+        strncpy(file_path, argv[2], sizeof(file_path) - 1);
+        num_threads = atoi(argv[3]);
+        
+        if (num_threads < 1) {
+            fprintf(stderr, COLOR_RED "Invalid thread count!\n" COLOR_RESET);
+            return -1;
+        }
+    } else if (argc == 1) {
+        // Interactive mode - prompt for inputs
+        printf(COLOR_CYAN "Enter server IP or domain: " COLOR_RESET);
+        fflush(stdout);
+        if (!fgets(server_ip, sizeof(server_ip), stdin)) return -1;
+        server_ip[strcspn(server_ip, "\n")] = 0;
+
+        printf(COLOR_CYAN "Enter absolute path of file on server: " COLOR_RESET);
+        fflush(stdout);
+        if (!fgets(file_path, sizeof(file_path), stdin)) return -1;
+        file_path[strcspn(file_path, "\n")] = 0;
+
+        printf(COLOR_CYAN "Enter number of threads: " COLOR_RESET);
+        fflush(stdout);
+        if (scanf("%d", &num_threads) != 1 || num_threads < 1) {
+            fprintf(stderr, COLOR_RED "Invalid thread count!\n" COLOR_RESET);
+            return -1;
+        }
+        getchar(); // eat trailing newline
+    } else {
+        // Wrong number of arguments
+        fprintf(stderr, COLOR_YELLOW "Usage: %s [<server_ip> <file_path> <num_threads>]\n" COLOR_RESET, argv[0]);
+        fprintf(stderr, "  Run without arguments for interactive mode\n");
         return -1;
     }
-    
-    char* server_ip = argv[1];
-    
-    if (argc == 3 && strcmp(argv[2], "--list") == 0) {
-        list_server_files(server_ip);
-        return 0;
-    }
-    
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <server_ip> <file_path> <num_threads>\n", argv[0]);
-        fprintf(stderr, "   or: %s <server_ip> --list\n", argv[0]);
-        return -1;
-    }
-    
-    char* file_path = argv[2];
-    int num_threads = atoi(argv[3]);
-    
+
+    // Create Downloads directory if needed
     struct stat st = {0};
     if (stat("Downloads", &st) == -1) {
         mkdir("Downloads", 0755);
     }
-    
-    char *file_name_only = basename(file_path);
-    
+
     long file_size = 0;
     unsigned char server_hash[EVP_MAX_MD_SIZE];
-    printf(COLOR_BLUE "🔍 Asking server for info about '%s'...\n" COLOR_RESET, file_path);
+    printf(COLOR_BLUE "\nAsking server for info about '%s'...\n" COLOR_RESET, file_path);
     
     if (get_file_info(server_ip, file_path, &file_size, server_hash) != 0) {
+        fprintf(stderr, COLOR_RED "✗ Could not get file info from server\n" COLOR_RESET);
         return -1;
     }
-    
+
     printf(COLOR_GREEN "✓ File size: %ld bytes (%.2f MB)\n" COLOR_RESET, 
            file_size, file_size / (1024.0 * 1024.0));
-    
-    char output_file_path[512];
-    snprintf(output_file_path, sizeof(output_file_path), "Downloads/%s", file_name_only);
-    
-    int output_fd = open(output_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    char *file_name_only = basename(file_path);
+    char output_filename[512];
+    snprintf(output_filename, sizeof(output_filename), "Downloads/%s", file_name_only);
+
+    int output_fd = open(output_filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (output_fd < 0) {
-        perror("Failed to create output file");
+        perror(COLOR_RED "Failed to create output file" COLOR_RESET);
         return -1;
     }
-    
+
     global_progress.total_bytes = file_size;
     global_progress.bytes_downloaded = 0;
     global_progress.start_time = time(NULL);
     global_progress.active = 1;
-    
+
     pthread_t progress_thread;
     pthread_create(&progress_thread, NULL, progress_display, NULL);
-    
-    printf(COLOR_BLUE "🚀 Starting %d download threads...\n" COLOR_RESET, num_threads);
+
+    printf(COLOR_BLUE "\nStarting %d download threads...\n" COLOR_RESET, num_threads);
     pthread_t threads[num_threads];
     thread_arg args[num_threads];
     
@@ -478,29 +496,29 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
-    
+
     global_progress.active = 0;
     pthread_join(progress_thread, NULL);
-    
+
     close(output_fd);
-    printf(COLOR_GREEN "\n✓ Transfer complete: '%s'\n" COLOR_RESET, output_file_path);
-    
-    printf(COLOR_BLUE "🔐 Verifying integrity...\n" COLOR_RESET);
+    printf(COLOR_GREEN "\n✓ Transfer complete: '%s'\n" COLOR_RESET, output_filename);
+
+    printf(COLOR_BLUE "\n🔐 Verifying integrity...\n" COLOR_RESET);
     unsigned char client_hash[EVP_MAX_MD_SIZE];
     unsigned int client_hash_len = 0;
-    calculate_hash(output_file_path, client_hash, &client_hash_len);
-    
+    calculate_hash(output_filename, client_hash, &client_hash_len);
+
     if (client_hash_len > 0 && memcmp(server_hash, client_hash, client_hash_len) == 0) {
-        printf(COLOR_GREEN "✓ Hash verified!\n" COLOR_RESET);
+        printf(COLOR_GREEN "\n✓ Hash verified!\n" COLOR_RESET);
     } else {
-        printf(COLOR_RED "✗ Hash mismatch!\n" COLOR_RESET);
+        printf(COLOR_RED "\n✗ Hash mismatch!\n" COLOR_RESET);
     }
-    
+
     printf("\nServer:   ");
     for(int i=0; i < 32; i++) printf("%02x", server_hash[i]);
     printf("\nReceived: ");
     for(int i=0; i < client_hash_len; i++) printf("%02x", client_hash[i]);
     printf("\n");
-    
+
     return 0;
 }
