@@ -77,7 +77,7 @@ The client does not require `sudo` privileges.
 
     # ./client
 
-    #Or
+    # Or
 
     #./client <server_ip_or_domain <absolute_path_on_server> <num_threads>
 
