@@ -73,8 +73,14 @@ The client does not require `sudo` privileges.
 
 1.  **Run the client:**
     ```bash
-    # Usage: ./client <server_ip_or_domain> <absolute_path_on_server> <num_threads>
-    
+    # Usage: 
+
+    # ./client
+
+    #Or
+
+    #./client <server_ip_or_domain <absolute_path_on_server> <num_threads>
+
     # Example: ./client vm.niranjan0.xyz /home/nir/test.zip 4
     ```
 2.  This command will download the file using 4 parallel connections and saves it to a local `Downloads/` folder with the original filename.
@@ -90,8 +96,8 @@ The program follows a specific protocol to ensure an efficient and verifiable tr
 3.  **The Client's Plan:** The client receives the metadata. It now has the expected hash for verification and the total size for calculating segments.
 4.  **Parallel Connections:** The client spawns the user-specified number of threads (e.g., 4 threads), each opening its own SSH session.
 5.  **The `GET` Request:** Each thread requests a unique segment of the file via a `GET` command.
-    * Thread 0 asks for: `GET <file_name> 0 8`
-    * Thread 1 asks for: `GET <file_name> 1 8`
+    * Thread 0 asks for: `GET <file_name> 0 4`
+    * Thread 1 asks for: `GET <file_name> 1 4`
     * ...and so on.
 6.  **Segment Delivery:** The server handles each connection concurrently, streaming the appropriate segment of the file to each client thread.
 7.  **File Reassembly:** On the client, threads write directly into their file chunk offset using `pwrite()`, allowing simultaneous writes without overlap or mutexes.
